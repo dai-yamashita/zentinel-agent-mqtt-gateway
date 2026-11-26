@@ -5,6 +5,7 @@
 mod parser;
 mod topic;
 
+pub(crate) use parser::{check_packets, split_packets};
 pub use parser::{
     parse_packet, MqttPacket, MqttPacketType, ParsedConnect, ParsedPublish, ParsedSubscribe,
     ParsedUnsubscribe,

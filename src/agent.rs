@@ -6,14 +6,17 @@ use crate::acl::{AclEvaluator, AclRequest};
 use crate::auth::Authenticator;
 use crate::config::{ConnectionContext, MqttAction, MqttGatewayConfig};
 use crate::inspection::PayloadInspector;
-use crate::mqtt::{parse_packet, MqttPacket, ParsedConnect, ParsedPublish, ParsedSubscribe};
+use crate::mqtt::{
+    check_packets, parse_packet, split_packets, MqttPacket, ParsedConnect, ParsedPublish,
+    ParsedSubscribe,
+};
 use crate::qos::QosEnforcer;
 use crate::ratelimit::RateLimiter;
 use crate::retained::RetainedController;
 
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -25,7 +28,8 @@ use zentinel_agent_protocol::v2::{
     HealthStatus, MetricsReport, ShutdownReason,
 };
 use zentinel_agent_protocol::{
-    AgentResponse, AuditMetadata, EventType, RequestHeadersEvent, WebSocketFrameEvent,
+    AgentResponse, AuditMetadata, EventType, RequestCompleteEvent, RequestHeadersEvent,
+    WebSocketDecision, WebSocketFrameEvent,
 };
 
 /// MQTT Gateway Agent
@@ -46,6 +50,13 @@ pub struct MqttGatewayAgent {
     retained_controller: Arc<RetainedController>,
     /// Connection contexts (keyed by correlation_id)
     connections: DashMap<String, ConnectionContext>,
+    /// Connections (keyed by correlation_id) that are part-way through a
+    /// binary WebSocket message: a binary frame without FIN has been seen and
+    /// the FIN frame has not. Holds one entry per such connection, no data.
+    /// A `DISCONNECT` does not remove an entry: it tracks the WebSocket
+    /// message, which only a FIN frame ends, so the rest of a message that
+    /// carries a `DISCONNECT` is still read.
+    binary_messages: DashSet<String>,
     /// Metrics: total requests processed
     requests_total: AtomicU64,
     /// Metrics: total requests blocked
@@ -89,6 +100,7 @@ impl MqttGatewayAgent {
             qos_enforcer: Arc::new(qos_enforcer),
             retained_controller: Arc::new(retained_controller),
             connections: DashMap::new(),
+            binary_messages: DashSet::new(),
             requests_total: AtomicU64::new(0),
             requests_blocked: AtomicU64::new(0),
             auth_failures: AtomicU64::new(0),
@@ -182,22 +194,104 @@ impl MqttGatewayAgent {
         Ok(changed)
     }
 
-    /// Process an MQTT packet from a WebSocket frame
-    fn process_mqtt_packet(
+    /// Process the MQTT packets in one WebSocket frame.
+    ///
+    /// A frame may carry several packets back to back. The whole frame is
+    /// read before any packet in it is acted on, so a frame that cannot be
+    /// read changes no state. Packets are decoded one at a time and not kept,
+    /// so the memory used does not grow with the number of packets.
+    /// The packets are then handled in order, and the first one that is not
+    /// allowed decides the frame. The packets before it have been handled by
+    /// then, so what they changed stays when the frame is refused: a
+    /// `CONNECT` keeps its connection context and a `PUBLISH` keeps the rate
+    /// limit it used, although the broker never receives them. In detect-only
+    /// mode a refusal is logged and the packet allowed, so handling goes on
+    /// with the next packet; a close still stops it. When every packet is
+    /// allowed the frame is allowed, with the tags, rule IDs and reason codes
+    /// of all of them.
+    ///
+    /// `fragment` is true when the frame is only part of a WebSocket message.
+    fn process_mqtt_frame(
         &self,
         correlation_id: &str,
         client_ip: &str,
         data: &[u8],
+        fragment: bool,
     ) -> AgentResponse {
-        // Parse MQTT packet
-        let packet = match parse_packet(data) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(error = %e, "Failed to parse MQTT packet");
-                return self.block_response("mqtt-parse-error", "Invalid MQTT packet");
-            }
-        };
+        if let Err(e) = check_packets(data) {
+            return self.unreadable_frame(&e, fragment);
+        }
 
+        let mut combined: Option<AgentResponse> = None;
+        for bytes in split_packets(data) {
+            let packet = match bytes.and_then(parse_packet) {
+                Ok(packet) => packet,
+                // Not reachable: check_packets decoded these same bytes. If it
+                // ever happens the frame is refused rather than let through.
+                Err(e) => return self.unreadable_frame(&e, fragment),
+            };
+            let response = self.process_mqtt_packet(correlation_id, client_ip, packet);
+            if !matches!(
+                response.websocket_decision,
+                None | Some(WebSocketDecision::Allow)
+            ) {
+                return self.keep_message_whole(response, fragment, 1008, "Policy violation");
+            }
+            match combined.as_mut() {
+                Some(combined) => merge_metadata(&mut combined.audit, response.audit),
+                None => combined = Some(response),
+            }
+        }
+
+        // A frame with no bytes holds no packet and has nothing to forward
+        combined.unwrap_or_else(AgentResponse::websocket_allow)
+    }
+
+    /// Response for a frame whose bytes are not whole, readable MQTT packets.
+    /// A packet that continues in another frame is not put back together.
+    fn unreadable_frame(&self, error: &anyhow::Error, fragment: bool) -> AgentResponse {
+        warn!(error = %error, "Failed to parse MQTT packet");
+        let response = self.block_response("mqtt-parse-error", "Invalid MQTT packet");
+        self.keep_message_whole(response, fragment, 1002, "Invalid MQTT packet")
+    }
+
+    /// Turn a drop into a close when the frame is only part of a WebSocket
+    /// message: without one of its frames the broker would see a message that
+    /// is cut short. The rule IDs and reason codes of the refusal are kept.
+    fn keep_message_whole(
+        &self,
+        response: AgentResponse,
+        fragment: bool,
+        code: u16,
+        reason: &str,
+    ) -> AgentResponse {
+        if !fragment || response.websocket_decision != Some(WebSocketDecision::Drop) {
+            return response;
+        }
+        let mut response = response.with_websocket_decision(WebSocketDecision::Close {
+            code,
+            reason: reason.to_string(),
+        });
+        response.audit.tags.push("connection-closed".to_string());
+        response
+    }
+
+    /// The connection's binary message, if one is open, has ended.
+    fn end_binary_message(&self, id: &str) {
+        // Looked at first because removing takes a write lock, and almost
+        // every frame has nothing to remove
+        if self.binary_messages.contains(id) {
+            self.binary_messages.remove(id);
+        }
+    }
+
+    /// Process one parsed MQTT packet
+    fn process_mqtt_packet(
+        &self,
+        correlation_id: &str,
+        client_ip: &str,
+        packet: MqttPacket,
+    ) -> AgentResponse {
         match packet {
             MqttPacket::Connect(connect) => {
                 self.handle_connect(correlation_id, client_ip, &connect)
@@ -539,6 +633,59 @@ impl MqttGatewayAgent {
     }
 }
 
+/// Add the metadata of a later packet in a frame to that of the packets
+/// before it, so that it grows with the kinds of refusal and not with the
+/// number of packets. Tags are listed once. A rule ID and the reason code
+/// at the same position form a pair, kept in order and added only if the pair
+/// is not there yet, so that the n-th reason still belongs to the n-th rule.
+/// This agent makes one of each per refusal; any left over when the lengths
+/// differ are listed once, like tags. The higher confidence is kept, and
+/// custom entries of the later packet replace those with the same key.
+fn merge_metadata(metadata: &mut AuditMetadata, other: AuditMetadata) {
+    // Every field is named, so a new one in AuditMetadata fails to compile here
+    let AuditMetadata {
+        tags,
+        rule_ids,
+        confidence,
+        reason_codes,
+        custom,
+    } = other;
+    for tag in tags {
+        if !metadata.tags.contains(&tag) {
+            metadata.tags.push(tag);
+        }
+    }
+    let pairs = rule_ids.len().min(reason_codes.len());
+    let mut rules = rule_ids.into_iter();
+    let mut reasons = reason_codes.into_iter();
+    for (rule, reason) in rules.by_ref().take(pairs).zip(reasons.by_ref().take(pairs)) {
+        let known = metadata
+            .rule_ids
+            .iter()
+            .zip(&metadata.reason_codes)
+            .any(|(r, c)| *r == rule && *c == reason);
+        if !known {
+            metadata.rule_ids.push(rule);
+            metadata.reason_codes.push(reason);
+        }
+    }
+    for rule in rules {
+        if !metadata.rule_ids.contains(&rule) {
+            metadata.rule_ids.push(rule);
+        }
+    }
+    for reason in reasons {
+        if !metadata.reason_codes.contains(&reason) {
+            metadata.reason_codes.push(reason);
+        }
+    }
+    metadata.confidence = match (metadata.confidence, confidence) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    metadata.custom.extend(custom);
+}
+
 impl Default for MqttGatewayAgent {
     fn default() -> Self {
         Self::new().expect("Failed to create default MqttGatewayAgent")
@@ -557,6 +704,7 @@ impl AgentHandlerV2 for MqttGatewayAgent {
             supported_events: vec![
                 EventType::Configure,
                 EventType::RequestHeaders,
+                EventType::RequestComplete,
                 EventType::WebSocketFrame,
             ],
             features: AgentFeatures {
@@ -628,15 +776,41 @@ impl AgentHandlerV2 for MqttGatewayAgent {
     async fn on_websocket_frame(&self, event: WebSocketFrameEvent) -> AgentResponse {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
 
-        // Only inspect binary frames (MQTT over WebSocket)
-        if event.opcode != "binary" {
-            return AgentResponse::websocket_allow();
-        }
-
         // Only inspect client-to-server frames
         if !event.client_to_server {
             return AgentResponse::websocket_allow();
         }
+
+        // Only binary messages carry MQTT (MQTT over WebSocket). A `binary`
+        // frame starts one, and `continuation` frames carry on the message
+        // started last, so they are inspected only while that one is binary.
+        let id = &event.correlation_id;
+        let fragment = match event.opcode.as_str() {
+            "binary" => {
+                if event.fin {
+                    self.end_binary_message(id);
+                } else {
+                    self.binary_messages.insert(id.clone());
+                }
+                !event.fin
+            }
+            "continuation" => {
+                if !self.binary_messages.contains(id) {
+                    return AgentResponse::websocket_allow();
+                }
+                if event.fin {
+                    self.end_binary_message(id);
+                }
+                true
+            }
+            "text" => {
+                self.end_binary_message(id);
+                return AgentResponse::websocket_allow();
+            }
+            // Control frames can sit in the middle of a message and do not
+            // change what it is
+            _ => return AgentResponse::websocket_allow(),
+        };
 
         // Decode base64 payload
         let data = match BASE64.decode(&event.data) {
@@ -657,8 +831,25 @@ impl AgentHandlerV2 for MqttGatewayAgent {
             );
         }
 
-        // Process the MQTT packet
-        self.process_mqtt_packet(&event.correlation_id, &event.client_ip, &data)
+        // Process the MQTT packets
+        let response = self.process_mqtt_frame(id, &event.client_ip, &data, fragment);
+        if matches!(
+            response.websocket_decision,
+            Some(WebSocketDecision::Close { .. })
+        ) {
+            self.end_binary_message(id);
+        }
+        response
+    }
+
+    /// The proxy sends this when a WebSocket connection ends, as it does for
+    /// any request, whatever `events` the agent block lists. The state kept
+    /// for the connection is dropped, since a `DISCONNECT` may never have
+    /// been seen.
+    async fn on_request_complete(&self, event: RequestCompleteEvent) -> AgentResponse {
+        self.connections.remove(&event.correlation_id);
+        self.end_binary_message(&event.correlation_id);
+        AgentResponse::default_allow()
     }
 
     /// Return current health status
@@ -729,6 +920,7 @@ impl AgentHandlerV2 for MqttGatewayAgent {
         );
         // Clear connection contexts on shutdown
         self.connections.clear();
+        self.binary_messages.clear();
     }
 
     /// Handle drain request from proxy
@@ -915,5 +1107,787 @@ mod configure_tests {
             agent.config.read().retained.allowed_topics,
             vec!["config/#".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use mqttrs::{encode_slice, Connect, Packet, Protocol, Publish, QosPid};
+    use serde_json::json;
+
+    const ALLOWED_TOPIC: &str = "sensors/a/data";
+    const DENIED_TOPIC: &str = "internal/a";
+    const RESTRICTED_TOPIC: &str = "restricted/a";
+
+    fn encode(packet: Packet) -> Vec<u8> {
+        let mut buf = [0u8; 256];
+        let len = encode_slice(&packet, &mut buf).unwrap();
+        buf[..len].to_vec()
+    }
+
+    fn connect_packet() -> Vec<u8> {
+        encode(Packet::Connect(Connect {
+            protocol: Protocol::MQTT311,
+            keep_alive: 30,
+            client_id: "client-a",
+            clean_session: true,
+            last_will: None,
+            username: None,
+            password: None,
+        }))
+    }
+
+    fn publish_packet(topic: &str, payload: &[u8]) -> Vec<u8> {
+        encode(Packet::Publish(Publish {
+            dup: false,
+            qospid: QosPid::AtMostOnce,
+            retain: false,
+            topic_name: topic,
+            payload,
+        }))
+    }
+
+    fn allowed_publish() -> Vec<u8> {
+        publish_packet(ALLOWED_TOPIC, b"hello")
+    }
+
+    fn acl_denied_publish() -> Vec<u8> {
+        publish_packet(DENIED_TOPIC, b"hello")
+    }
+
+    /// Refused by an ACL rule that names it, not by the default.
+    fn restricted_publish() -> Vec<u8> {
+        publish_packet(RESTRICTED_TOPIC, b"hello")
+    }
+
+    /// Allowed by the ACL, refused by the payload size limit (16 bytes).
+    fn oversized_publish() -> Vec<u8> {
+        publish_packet(ALLOWED_TOPIC, b"a payload over the limit")
+    }
+
+    fn disconnect_packet() -> Vec<u8> {
+        encode(Packet::Disconnect)
+    }
+
+    fn frame(opcode: &str, fin: bool, data: &[u8]) -> WebSocketFrameEvent {
+        WebSocketFrameEvent {
+            correlation_id: "c1".to_string(),
+            opcode: opcode.to_string(),
+            data: BASE64.encode(data),
+            client_to_server: true,
+            frame_index: 0,
+            fin,
+            route_id: None,
+            client_ip: "192.0.2.1".to_string(),
+        }
+    }
+
+    fn binary(data: &[u8]) -> WebSocketFrameEvent {
+        frame("binary", true, data)
+    }
+
+    fn settings(block_mode: bool) -> serde_json::Value {
+        json!({
+            "acl": {
+                "default-action": "deny",
+                "rules": [
+                    {"name": "allow-sensors", "topics": ["sensors/#"], "decision": "allow"},
+                    {"name": "deny-restricted", "topics": ["restricted/#"], "decision": "deny"}
+                ]
+            },
+            "inspection": {"enabled": true, "max-payload-size": 16},
+            "general": {"block-mode": block_mode}
+        })
+    }
+
+    fn agent() -> MqttGatewayAgent {
+        let config = MqttGatewayConfig::from_json(&settings(true)).unwrap();
+        MqttGatewayAgent::with_config(config).unwrap()
+    }
+
+    fn detect_only_agent() -> MqttGatewayAgent {
+        let config = MqttGatewayConfig::from_json(&settings(false)).unwrap();
+        MqttGatewayAgent::with_config(config).unwrap()
+    }
+
+    /// An agent that allows two messages per client and then limits it.
+    fn rate_limited_agent() -> MqttGatewayAgent {
+        let mut value = settings(true);
+        value["rate-limit"] = json!({
+            "enabled": true,
+            "per-client": {"messages-per-second": 1, "burst": 2}
+        });
+        MqttGatewayAgent::with_config(MqttGatewayConfig::from_json(&value).unwrap()).unwrap()
+    }
+
+    /// An agent that has seen an allowed CONNECT for correlation ID `c1`.
+    async fn connected(agent: MqttGatewayAgent) -> MqttGatewayAgent {
+        let response = agent.on_websocket_frame(binary(&connect_packet())).await;
+        assert_eq!(outcome(&response), Expect::Allow);
+        agent
+    }
+
+    /// The decision on a frame.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Expect {
+        Allow,
+        Drop,
+        Close(u16),
+    }
+
+    fn outcome(response: &AgentResponse) -> Expect {
+        match &response.websocket_decision {
+            Some(WebSocketDecision::Allow) => Expect::Allow,
+            Some(WebSocketDecision::Drop) => Expect::Drop,
+            Some(WebSocketDecision::Close { code, .. }) => Expect::Close(*code),
+            None => panic!("the response has no WebSocket decision"),
+        }
+    }
+
+    fn rule_ids(response: &AgentResponse) -> Vec<&str> {
+        response.audit.rule_ids.iter().map(String::as_str).collect()
+    }
+
+    fn request_complete() -> RequestCompleteEvent {
+        RequestCompleteEvent {
+            correlation_id: "c1".to_string(),
+            status: 101,
+            duration_ms: 1000,
+            request_body_size: 0,
+            response_body_size: 0,
+            upstream_attempts: 1,
+            error: None,
+        }
+    }
+
+    // ---- several packets in one frame ----
+
+    #[tokio::test]
+    async fn frame_with_a_refused_packet_is_dropped_wherever_the_packet_is() {
+        // (case, connect first, the packets of the frame, the rule that refuses)
+        let cases = [
+            (
+                "CONNECT then ACL-refused PUBLISH",
+                false,
+                vec![connect_packet(), acl_denied_publish()],
+                "acl-denied",
+            ),
+            (
+                "allowed then ACL-refused PUBLISH",
+                true,
+                vec![allowed_publish(), acl_denied_publish()],
+                "acl-denied",
+            ),
+            (
+                "ACL-refused then allowed PUBLISH",
+                true,
+                vec![acl_denied_publish(), allowed_publish()],
+                "acl-denied",
+            ),
+            (
+                "allowed then payload-refused PUBLISH",
+                true,
+                vec![allowed_publish(), oversized_publish()],
+                "inspection-blocked",
+            ),
+            (
+                "payload-refused then allowed PUBLISH",
+                true,
+                vec![oversized_publish(), allowed_publish()],
+                "inspection-blocked",
+            ),
+            (
+                "two allowed then ACL-refused PUBLISH",
+                true,
+                vec![allowed_publish(), allowed_publish(), acl_denied_publish()],
+                "acl-denied",
+            ),
+            (
+                "the first refusal decides",
+                true,
+                vec![acl_denied_publish(), oversized_publish()],
+                "acl-denied",
+            ),
+        ];
+        for (case, connect_first, packets, rule) in cases {
+            let agent = if connect_first {
+                connected(agent()).await
+            } else {
+                agent()
+            };
+
+            let response = agent.on_websocket_frame(binary(&packets.concat())).await;
+
+            assert_eq!(outcome(&response), Expect::Drop, "{case}");
+            assert_eq!(rule_ids(&response), vec![rule], "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_frame_is_dropped_and_closes_a_fragmented_message() {
+        let mut cut_off = allowed_publish();
+        cut_off.pop();
+        let cases = [
+            (
+                "packet type 0 after a PUBLISH",
+                [allowed_publish(), vec![0x00, 0x00]].concat(),
+            ),
+            (
+                "fixed header cut off before its length",
+                [allowed_publish(), vec![0x30]].concat(),
+            ),
+            (
+                "remaining length that never ends",
+                [allowed_publish(), vec![0x30, 0x80, 0x80, 0x80, 0x80]].concat(),
+            ),
+            (
+                "remaining length cut off",
+                [allowed_publish(), vec![0x30, 0x80]].concat(),
+            ),
+            (
+                "PUBLISH cut off at the end of the frame",
+                [allowed_publish(), cut_off].concat(),
+            ),
+            (
+                "remaining length longer than the rest of the frame",
+                [allowed_publish(), vec![0x30, 0x05, 0x00]].concat(),
+            ),
+            (
+                "remaining length of 0 spelled in two bytes",
+                [allowed_publish(), vec![0x30, 0x80, 0x00]].concat(),
+            ),
+            (
+                "PUBACK shorter than its fields",
+                [allowed_publish(), vec![0x40, 0x00]].concat(),
+            ),
+            (
+                "CONNACK shorter than its fields after a refused PUBLISH",
+                [acl_denied_publish(), vec![0x20, 0x00]].concat(),
+            ),
+            ("SUBSCRIBE shorter than its fields", vec![0x82, 0x00]),
+            (
+                "front half of a PUBLISH that continues in the next frame",
+                allowed_publish()[..allowed_publish().len() / 2].to_vec(),
+            ),
+            (
+                "front half of a CONNECT that continues in the next frame",
+                connect_packet()[..connect_packet().len() / 2].to_vec(),
+            ),
+            (
+                "CONNECT shorter than its fields",
+                vec![0x10, 0x06, 0x00, 0x04, b'M', b'Q', b'T', b'T'],
+            ),
+        ];
+        for (case, data) in cases {
+            let agent = connected(agent()).await;
+
+            let whole = agent.on_websocket_frame(binary(&data)).await;
+            assert_eq!(outcome(&whole), Expect::Drop, "{case}");
+            assert_eq!(rule_ids(&whole), vec!["mqtt-parse-error"], "{case}");
+
+            let fragment = agent
+                .on_websocket_frame(frame("binary", false, &data))
+                .await;
+            assert_eq!(outcome(&fragment), Expect::Close(1002), "{case}");
+            assert_eq!(rule_ids(&fragment), vec!["mqtt-parse-error"], "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_frame_acts_on_none_of_its_packets() {
+        for unreadable in [vec![0x00, 0x00], vec![0x40, 0x00]] {
+            let agent = agent();
+            let data = [connect_packet(), unreadable.clone()].concat();
+
+            let response = agent.on_websocket_frame(binary(&data)).await;
+
+            assert_eq!(outcome(&response), Expect::Drop, "{unreadable:?}");
+            assert!(
+                agent.connections.is_empty(),
+                "the CONNECT in a dropped frame must not create a connection"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_with_two_allowed_packets_is_allowed_with_the_tags_of_both() {
+        let agent = agent();
+        let data = [connect_packet(), allowed_publish()].concat();
+
+        let response = agent.on_websocket_frame(binary(&data)).await;
+
+        assert_eq!(outcome(&response), Expect::Allow);
+        assert_eq!(
+            response.audit.tags,
+            vec!["mqtt", "connect", "success", "publish"]
+        );
+        assert!(response.audit.rule_ids.is_empty());
+
+        let data = [allowed_publish(), allowed_publish()].concat();
+        let response = agent.on_websocket_frame(binary(&data)).await;
+
+        assert_eq!(outcome(&response), Expect::Allow);
+        assert_eq!(response.audit.tags, vec!["mqtt", "publish"]);
+    }
+
+    #[tokio::test]
+    async fn packets_in_a_frame_are_handled_in_order() {
+        let agent = agent();
+        // The DISCONNECT removes the connection the PUBLISH would need.
+        let data = [connect_packet(), disconnect_packet(), allowed_publish()].concat();
+
+        let response = agent.on_websocket_frame(binary(&data)).await;
+
+        assert_eq!(outcome(&response), Expect::Close(0x01));
+        assert_eq!(rule_ids(&response), vec!["no-context"]);
+    }
+
+    #[tokio::test]
+    async fn refused_frame_keeps_what_the_packets_before_the_refusal_set() {
+        let agent = agent();
+        let data = [connect_packet(), acl_denied_publish()].concat();
+
+        let refused = agent.on_websocket_frame(binary(&data)).await;
+        assert_eq!(outcome(&refused), Expect::Drop);
+
+        // The CONNECT was handled, although the broker never receives it.
+        let next = agent.on_websocket_frame(binary(&allowed_publish())).await;
+        assert_eq!(outcome(&next), Expect::Allow);
+    }
+
+    #[tokio::test]
+    async fn refused_frame_keeps_the_rate_limit_the_packets_before_the_refusal_used() {
+        // The limiter refills in real time, at one message per second or
+        // faster (it has no slower setting), so this relies on the two frames
+        // following each other within a second.
+        let agent = connected(rate_limited_agent()).await;
+        // Two messages are allowed per client: both are spent by this frame.
+        let data = [allowed_publish(), oversized_publish()].concat();
+
+        let refused = agent.on_websocket_frame(binary(&data)).await;
+        assert_eq!(outcome(&refused), Expect::Drop);
+        assert_eq!(rule_ids(&refused), vec!["inspection-blocked"]);
+
+        let next = agent.on_websocket_frame(binary(&allowed_publish())).await;
+        assert_eq!(outcome(&next), Expect::Drop);
+        assert_eq!(rule_ids(&next), vec!["rate-limited"]);
+    }
+
+    #[tokio::test]
+    async fn empty_frame_is_allowed() {
+        let agent = agent();
+
+        let response = agent.on_websocket_frame(binary(&[])).await;
+
+        assert_eq!(outcome(&response), Expect::Allow);
+    }
+
+    // ---- detect-only mode ----
+
+    #[tokio::test]
+    async fn detect_only_frame_handles_every_packet_and_allows() {
+        let agent = connected(detect_only_agent()).await;
+        for data in [
+            [allowed_publish(), acl_denied_publish()].concat(),
+            [acl_denied_publish(), allowed_publish()].concat(),
+        ] {
+            let response = agent.on_websocket_frame(binary(&data)).await;
+
+            assert_eq!(outcome(&response), Expect::Allow);
+            assert!(response.audit.tags.contains(&"detect-only".to_string()));
+            assert_eq!(rule_ids(&response), vec!["acl-denied"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_only_frame_lists_the_same_refusal_once() {
+        let agent = connected(detect_only_agent()).await;
+        let data = [
+            acl_denied_publish(),
+            acl_denied_publish(),
+            acl_denied_publish(),
+        ]
+        .concat();
+
+        let response = agent.on_websocket_frame(binary(&data)).await;
+
+        assert_eq!(outcome(&response), Expect::Allow);
+        assert_eq!(rule_ids(&response), vec!["acl-denied"]);
+        assert_eq!(response.audit.reason_codes.len(), 1);
+        assert_eq!(response.audit.tags, vec!["mqtt", "detect-only"]);
+    }
+
+    #[tokio::test]
+    async fn detect_only_frame_lists_each_kind_of_refusal_in_order() {
+        let agent = connected(detect_only_agent()).await;
+        let data = [
+            acl_denied_publish(),
+            allowed_publish(),
+            oversized_publish(),
+            restricted_publish(),
+            acl_denied_publish(),
+            oversized_publish(),
+        ]
+        .concat();
+
+        let response = agent.on_websocket_frame(binary(&data)).await;
+
+        assert_eq!(outcome(&response), Expect::Allow);
+        // The same rule ID with another reason is another pair, and the n-th
+        // reason still belongs to the n-th rule.
+        assert_eq!(
+            rule_ids(&response),
+            vec!["acl-denied", "inspection-blocked", "acl-denied"]
+        );
+        let reasons = &response.audit.reason_codes;
+        assert_eq!(reasons.len(), 3);
+        assert_eq!(reasons[0], "No matching rule, default deny");
+        assert!(reasons[1].contains("size-limit"), "{}", reasons[1]);
+        assert_eq!(reasons[2], "Denied by rule: deny-restricted");
+        assert_eq!(response.audit.tags, vec!["mqtt", "detect-only", "publish"]);
+    }
+
+    #[tokio::test]
+    async fn detect_only_frame_still_stops_at_a_close() {
+        let agent = connected(detect_only_agent()).await;
+        let data = [acl_denied_publish(), disconnect_packet(), allowed_publish()].concat();
+
+        let response = agent.on_websocket_frame(binary(&data)).await;
+
+        assert_eq!(outcome(&response), Expect::Close(0x01));
+        assert_eq!(rule_ids(&response), vec!["no-context"]);
+    }
+
+    #[tokio::test]
+    async fn detect_only_frame_that_cannot_be_read_is_still_refused() {
+        let agent = connected(detect_only_agent()).await;
+        let data = [acl_denied_publish(), vec![0x00, 0x00]].concat();
+
+        let whole = agent.on_websocket_frame(binary(&data)).await;
+        let fragment = agent
+            .on_websocket_frame(frame("binary", false, &data))
+            .await;
+
+        assert_eq!(outcome(&whole), Expect::Drop);
+        assert_eq!(outcome(&fragment), Expect::Close(1002));
+    }
+
+    #[tokio::test]
+    async fn detect_only_fragment_is_allowed() {
+        let agent = connected(detect_only_agent()).await;
+
+        let first = agent
+            .on_websocket_frame(frame("binary", false, &acl_denied_publish()))
+            .await;
+        let last = agent
+            .on_websocket_frame(frame("continuation", true, &acl_denied_publish()))
+            .await;
+
+        assert_eq!(outcome(&first), Expect::Allow);
+        assert_eq!(outcome(&last), Expect::Allow);
+        assert_eq!(rule_ids(&last), vec!["acl-denied"]);
+    }
+
+    // ---- messages split over several frames ----
+
+    /// One frame of a sequence, and the decision it should get.
+    struct Step {
+        opcode: &'static str,
+        fin: bool,
+        from_client: bool,
+        data: Vec<u8>,
+        expect: Expect,
+    }
+
+    fn step(opcode: &'static str, fin: bool, data: Vec<u8>, expect: Expect) -> Step {
+        Step {
+            opcode,
+            fin,
+            from_client: true,
+            data,
+            expect,
+        }
+    }
+
+    fn from_server(step: Step) -> Step {
+        Step {
+            from_client: false,
+            ..step
+        }
+    }
+
+    #[tokio::test]
+    async fn only_frames_of_a_binary_message_are_inspected() {
+        use Expect::{Allow, Close, Drop};
+        let ok = allowed_publish;
+        let denied = acl_denied_publish;
+        let cases = [
+            (
+                "a refused continuation closes the connection",
+                vec![
+                    step("binary", false, ok(), Allow),
+                    step("continuation", true, denied(), Close(1008)),
+                ],
+            ),
+            (
+                "a refused continuation in the middle closes the connection",
+                vec![
+                    step("binary", false, ok(), Allow),
+                    step("continuation", false, denied(), Close(1008)),
+                ],
+            ),
+            (
+                "allowed frames of a three-frame message pass",
+                vec![
+                    step("binary", false, ok(), Allow),
+                    step("continuation", false, ok(), Allow),
+                    step("continuation", true, ok(), Allow),
+                ],
+            ),
+            (
+                "a refused first fragment closes the connection",
+                vec![step("binary", false, denied(), Close(1008))],
+            ),
+            (
+                "a refused whole message is dropped",
+                vec![step("binary", true, denied(), Drop)],
+            ),
+            (
+                "a continuation of a text message passes",
+                vec![
+                    step("text", false, b"hello".to_vec(), Allow),
+                    step("continuation", true, denied(), Allow),
+                ],
+            ),
+            (
+                "a continuation with no message in progress passes",
+                vec![step("continuation", true, denied(), Allow)],
+            ),
+            (
+                "a continuation after the message ended passes",
+                vec![
+                    step("binary", true, ok(), Allow),
+                    step("continuation", true, denied(), Allow),
+                ],
+            ),
+            (
+                "a text message after a binary message passes",
+                vec![
+                    step("binary", false, ok(), Allow),
+                    step("continuation", true, ok(), Allow),
+                    step("text", false, b"hello".to_vec(), Allow),
+                    step("continuation", true, denied(), Allow),
+                ],
+            ),
+            (
+                "a text frame starts a new message",
+                vec![
+                    step("binary", false, ok(), Allow),
+                    step("text", false, b"hello".to_vec(), Allow),
+                    step("continuation", true, denied(), Allow),
+                ],
+            ),
+            (
+                "ping and pong do not end the message",
+                vec![
+                    step("binary", false, ok(), Allow),
+                    step("ping", true, vec![], Allow),
+                    step("pong", true, vec![], Allow),
+                    step("continuation", true, denied(), Close(1008)),
+                ],
+            ),
+            (
+                "frames from the server do not end the message",
+                vec![
+                    step("binary", false, ok(), Allow),
+                    from_server(step("binary", true, denied(), Allow)),
+                    from_server(step("text", true, b"hello".to_vec(), Allow)),
+                    step("continuation", true, denied(), Close(1008)),
+                ],
+            ),
+            (
+                "a continuation from the server is not inspected",
+                vec![
+                    step("binary", false, ok(), Allow),
+                    from_server(step("continuation", true, denied(), Allow)),
+                ],
+            ),
+            (
+                "an empty final continuation passes",
+                vec![
+                    step("binary", false, ok(), Allow),
+                    step("continuation", true, vec![], Allow),
+                ],
+            ),
+        ];
+        for (case, steps) in cases {
+            let agent = connected(agent()).await;
+            for (n, step) in steps.into_iter().enumerate() {
+                let mut event = frame(step.opcode, step.fin, &step.data);
+                event.client_to_server = step.from_client;
+
+                let response = agent.on_websocket_frame(event).await;
+
+                assert_eq!(outcome(&response), step.expect, "{case}, frame {n}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_a_fragmented_message_keeps_the_details_of_the_refusal() {
+        let agent = connected(agent()).await;
+
+        let response = agent
+            .on_websocket_frame(frame("binary", false, &acl_denied_publish()))
+            .await;
+
+        assert_eq!(outcome(&response), Expect::Close(1008));
+        assert_eq!(rule_ids(&response), vec!["acl-denied"]);
+        assert_eq!(response.audit.reason_codes.len(), 1);
+        assert_eq!(
+            response.audit.tags,
+            vec!["mqtt", "blocked", "connection-closed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_inside_a_fragment_does_not_end_the_message() {
+        let agent = connected(agent()).await;
+
+        let first = agent
+            .on_websocket_frame(frame("binary", false, &disconnect_packet()))
+            .await;
+        let last = agent
+            .on_websocket_frame(frame("continuation", true, &allowed_publish()))
+            .await;
+
+        assert_eq!(outcome(&first), Expect::Allow);
+        // The rest of the message is still read; the connection is gone.
+        assert_eq!(outcome(&last), Expect::Close(0x01));
+        assert_eq!(rule_ids(&last), vec!["no-context"]);
+    }
+
+    // ---- state of a finished connection ----
+
+    #[tokio::test]
+    async fn request_complete_removes_the_connection() {
+        let agent = connected(agent()).await;
+        let before = agent.on_websocket_frame(binary(&allowed_publish())).await;
+        assert_eq!(outcome(&before), Expect::Allow);
+
+        agent.on_request_complete(request_complete()).await;
+        let after = agent.on_websocket_frame(binary(&allowed_publish())).await;
+
+        assert_eq!(outcome(&after), Expect::Close(0x01));
+        assert_eq!(rule_ids(&after), vec!["no-context"]);
+        assert!(agent.connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_complete_ends_a_binary_message_in_progress() {
+        let agent = connected(agent()).await;
+        agent
+            .on_websocket_frame(frame("binary", false, &allowed_publish()))
+            .await;
+
+        agent.on_request_complete(request_complete()).await;
+        let stray = agent
+            .on_websocket_frame(frame("continuation", true, &acl_denied_publish()))
+            .await;
+
+        assert_eq!(outcome(&stray), Expect::Allow);
+    }
+
+    #[tokio::test]
+    async fn message_state_is_kept_only_while_a_message_is_open() {
+        let agent = connected(agent()).await;
+        let on = |id: &str, mut event: WebSocketFrameEvent| {
+            event.correlation_id = id.to_string();
+            event
+        };
+
+        // A message that ends with FIN leaves nothing behind.
+        agent
+            .on_websocket_frame(frame("binary", false, &allowed_publish()))
+            .await;
+        assert_eq!(agent.binary_messages.len(), 1);
+        agent
+            .on_websocket_frame(frame("continuation", true, &allowed_publish()))
+            .await;
+        assert!(agent.binary_messages.is_empty());
+
+        // Neither does a whole message, a text message or a close.
+        agent.on_websocket_frame(binary(&allowed_publish())).await;
+        agent
+            .on_websocket_frame(frame("text", true, b"hello"))
+            .await;
+        assert!(agent.binary_messages.is_empty());
+        let refused = agent
+            .on_websocket_frame(frame("binary", false, &acl_denied_publish()))
+            .await;
+        assert_eq!(outcome(&refused), Expect::Close(1008));
+        assert!(agent.binary_messages.is_empty());
+
+        // The ones left open are removed when their connections complete.
+        for n in 0..10 {
+            let id = format!("open-{n}");
+            agent
+                .on_websocket_frame(on(&id, binary(&connect_packet())))
+                .await;
+            agent
+                .on_websocket_frame(on(&id, frame("binary", false, &allowed_publish())))
+                .await;
+        }
+        assert_eq!(agent.binary_messages.len(), 10);
+        assert_eq!(agent.connections.len(), 11);
+        for n in 0..10 {
+            let mut event = request_complete();
+            event.correlation_id = format!("open-{n}");
+            agent.on_request_complete(event).await;
+        }
+        assert!(agent.binary_messages.is_empty());
+        assert_eq!(agent.connections.len(), 1);
+        agent.on_request_complete(request_complete()).await;
+        assert!(agent.connections.is_empty());
+    }
+
+    // ---- frames that carry one packet behave as before ----
+
+    #[tokio::test]
+    async fn single_packet_frames_keep_their_decisions_and_metadata() {
+        let agent = agent();
+
+        let connect = agent.on_websocket_frame(binary(&connect_packet())).await;
+        assert_eq!(outcome(&connect), Expect::Allow);
+        assert_eq!(connect.audit.tags, vec!["mqtt", "connect", "success"]);
+
+        let allowed = agent.on_websocket_frame(binary(&allowed_publish())).await;
+        assert_eq!(outcome(&allowed), Expect::Allow);
+        assert_eq!(allowed.audit.tags, vec!["mqtt", "publish"]);
+
+        let denied = agent
+            .on_websocket_frame(binary(&acl_denied_publish()))
+            .await;
+        assert_eq!(outcome(&denied), Expect::Drop);
+        assert_eq!(denied.audit.tags, vec!["mqtt", "blocked"]);
+        assert_eq!(rule_ids(&denied), vec!["acl-denied"]);
+        assert_eq!(denied.audit.reason_codes.len(), 1);
+
+        let unreadable = agent.on_websocket_frame(binary(&[0x00, 0x00])).await;
+        assert_eq!(outcome(&unreadable), Expect::Drop);
+        assert_eq!(unreadable.audit.tags, vec!["mqtt", "error"]);
+        assert_eq!(rule_ids(&unreadable), vec!["mqtt-parse-error"]);
+        assert_eq!(
+            unreadable.audit.reason_codes,
+            vec!["Invalid MQTT packet".to_string()]
+        );
+
+        let truncated = agent.on_websocket_frame(binary(&[0x30, 0x05, 0x00])).await;
+        assert_eq!(outcome(&truncated), Expect::Drop);
+
+        let disconnect = agent.on_websocket_frame(binary(&disconnect_packet())).await;
+        assert_eq!(outcome(&disconnect), Expect::Allow);
+        assert!(agent.connections.is_empty());
     }
 }

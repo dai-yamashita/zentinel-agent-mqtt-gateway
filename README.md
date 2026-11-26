@@ -25,13 +25,14 @@
 </p>
 
 For IoT deployments that expose an MQTT broker over WebSocket behind Zentinel.
-The agent parses each client-to-server binary frame as an MQTT packet: it
+The agent reads every MQTT packet in each client-to-server binary frame: it
 authenticates `CONNECT` (bcrypt user file or HS256 JWT), checks `PUBLISH`,
 `SUBSCRIBE` and `UNSUBSCRIBE` against topic ACLs with `+` and `#` wildcards,
 and applies per-client and per-topic rate limits, QoS and retained-message
-rules and payload inspection to `PUBLISH`. A violation drops the frame; a
-failed `CONNECT` closes the connection. Native MQTT over TCP (1883/8883) is not
-handled, only MQTT over WebSocket.
+rules and payload inspection to `PUBLISH`. A violation drops the frame, or
+closes the connection when the frame is only part of a larger WebSocket
+message; a failed `CONNECT` closes the connection. Native MQTT over TCP
+(1883/8883) is not handled, only MQTT over WebSocket.
 
 ## Quick start
 
@@ -274,7 +275,7 @@ The user file for the `file` provider is JSON (other extensions fail to load):
 | `retained.enabled` | `false` | Apply retained-message rules |
 | `retained.allow-retained` | `true` | Allow the retain flag outside `allowed-topics` |
 | `retained.allowed-topics` / `blocked-topics` / `max-size` | `[]` / `[]` / none | Per-topic retain rules and a size cap |
-| `general.block-mode` | `true` | `false` logs policy violations and forwards the frame |
+| `general.block-mode` | `true` | `false` logs refused packets and allows them; closes and frames that cannot be read are unchanged |
 | `general.log-packets` | `false` | Log every inspected frame at debug level |
 
 Parsed but not used today: an ACL rule's `max-qos`, `acl.rules-file`,
@@ -288,9 +289,44 @@ Proxy-side options (`events`, `timeout-ms`, `failure-mode`):
 
 ## How it works
 
-Only binary, client-to-server frames are inspected, and each frame is parsed as
-one MQTT packet with `mqttrs`, which handles MQTT 3.1 and 3.1.1. A frame that
-does not parse is dropped, so MQTT 5.0 clients do not work through the agent.
+Only client-to-server frames of binary WebSocket messages are inspected: the
+`binary` frames, and the `continuation` frames of a message that started as
+`binary`. Text messages and their continuations, ping, pong and close frames
+pass through, and a control frame in the middle of a binary message does not
+end it.
+
+A frame can carry several MQTT packets back to back (MQTT 3.1.1, section 6).
+The agent reads the whole frame with `mqttrs`, which handles MQTT 3.1 and
+3.1.1, before it acts on any packet in it, and then checks the packets in
+order:
+
+- A frame that is not made up of whole, readable packets is dropped without
+  any of its packets being checked or acted on: a packet that does not parse,
+  a packet that is cut off at the end of the frame, or bytes after the last
+  packet. A packet that continues in the next frame is not put back together,
+  so it is dropped too. MQTT 5.0 clients do not work through the agent.
+- The first packet that is not allowed decides the frame. When one packet is
+  refused the whole frame is dropped, the packets before it included. Those
+  packets have been handled by then and what they set stays: a `CONNECT` keeps
+  its connection context and a `PUBLISH` keeps the rate limit it used, although
+  the broker never receives them.
+- With `general.block-mode` set to `false`, a refused packet is logged and
+  allowed instead of dropping the frame, so every packet is handled. Closes
+  and unreadable frames do not change: a failed `CONNECT`, or a `PUBLISH` or
+  `SUBSCRIBE` without a `CONNECT`, still closes the connection and stops
+  there, and a frame that cannot be read is still dropped (or closes the
+  connection, as below). The response lists the tags of the packets handled,
+  each once, and the rule IDs and reasons of the refusals as pairs, in order,
+  each distinct pair once.
+- A frame with no bytes is allowed.
+
+Dropping a frame that is only part of a WebSocket message (a `continuation`
+frame, or a `binary` frame without FIN) would leave the broker with a message
+that has a piece missing. In that case the agent closes the connection
+instead, with code `1008` when a packet is refused and `1002` when the frame
+cannot be read. The rule ID and reason of the refusal are kept in the
+response. Refusals that already closed the connection, such as a failed
+`CONNECT`, keep their own close codes.
 
 | Packet | Checks |
 |---|---|
@@ -302,8 +338,21 @@ does not parse is dropped, so MQTT 5.0 clients do not work through the agent.
 | `DISCONNECT` | Allowed; connection state is removed |
 
 `PUBLISH` or `SUBSCRIBE` before a successful `CONNECT` on the same connection
-closes it. The agent exports v2 metrics for requests, blocks, auth failures,
-ACL denials, rate-limit hits and inspection blocks.
+closes it. The agent keeps a context per connection (set by `CONNECT`, removed
+by `DISCONNECT`) and whether a binary message is open (set by a `binary` frame
+without FIN, removed when that message ends; a `DISCONNECT` does not remove it,
+because the rest of the message is still read).
+
+Zentinel 26.11_3 and later sends a `RequestComplete` event to the agent when a
+WebSocket connection ends, whatever `events` the agent block lists, so
+`events "websocket_frame"` is enough, and the agent then removes both. With an
+older Zentinel no `RequestComplete` arrives: the context is removed only by
+`DISCONNECT` or at shutdown, and the open-message flag only when its message
+ends (a FIN frame, a `text` frame, or a close decided by the agent) or at
+shutdown.
+
+The agent exports v2 metrics for requests, blocks, auth failures, ACL denials,
+rate-limit hits and inspection blocks.
 
 ## Releases and smoke test
 
