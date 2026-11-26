@@ -136,6 +136,11 @@ pub struct ParsedUnsubscribe {
 /// mqttrs 0.4.1 indexes past the end of a packet whose remaining length is
 /// shorter than its fields, and panics. Such a packet is treated as one that
 /// does not decode.
+///
+/// This relies on panics unwinding, the default: the crate sets no
+/// `[profile]`. With `panic = "abort"` such a packet would end the agent
+/// process instead, so keep the default, or check the remaining length against
+/// the packet's fields before calling the decoder.
 fn decode(data: &[u8]) -> Result<Packet<'_>> {
     catch_unwind(AssertUnwindSafe(|| decode_slice(data)))
         .map_err(|_| anyhow!("MQTT packet is shorter than its fields"))?
